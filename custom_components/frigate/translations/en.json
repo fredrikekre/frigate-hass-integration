@@ -11,7 +11,7 @@
           "auth_mode": "Authentication mode"
         },
         "data_description": {
-          "auth_mode": "'Frigate login' uses Frigate's native username/password login. 'HTTP Basic Auth' sends the username/password as a Basic Authorization header on every request (for reverse proxies enforcing Basic Auth in front of Frigate). 'Bearer token' sends the password as a static Bearer Authorization header on every request (username is ignored); use this for reverse proxies that expect a static token."
+          "auth_mode": "'Frigate login' uses Frigate's native username/password login. 'HTTP Basic Auth' sends the username/password as a Basic Authorization header (for reverse proxies enforcing Basic Auth in front of Frigate). 'Bearer token' sends the password as a static Bearer Authorization header (username is ignored); use this for reverse proxies that expect a static token. In both proxy modes, a session cookie set by the proxy is reused for subsequent requests where possible."
         }
       }
     },

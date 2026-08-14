@@ -7,6 +7,7 @@ import logging
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import aiohttp
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -16,22 +17,25 @@ from custom_components.frigate import (
     get_frigate_entity_unique_id,
     get_frigate_via_device,
 )
-from custom_components.frigate.api import FrigateApiClientError
+from custom_components.frigate.api import AUTH_MODE_BASIC, FrigateApiClientError
 from custom_components.frigate.const import (
+    CONF_AUTH_MODE,
     CONF_CAMERA_STATIC_IMAGE_HEIGHT,
     CONF_RTMP_URL_TEMPLATE,
     DOMAIN,
 )
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import CONF_HOST, CONF_URL
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_URL, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.loader import async_get_integration
 
 from . import (
     TEST_CONFIG,
     TEST_CONFIG_ENTRY_ID,
+    TEST_URL,
     create_mock_frigate_client,
     create_mock_frigate_config_entry,
     setup_mock_frigate_config_entry,
@@ -116,6 +120,40 @@ async def test_entry_unload(hass: HomeAssistant) -> None:
     config_entries = hass.config_entries.async_entries(DOMAIN)
     assert len(config_entries) == 1
     assert config_entries[0].state == ConfigEntryState.NOT_LOADED
+
+
+async def test_entry_proxy_auth_mode_uses_dedicated_session(
+    hass: HomeAssistant,
+) -> None:
+    """Test that the proxy auth modes use a dedicated cookie-capable session."""
+
+    config_entry = create_mock_frigate_config_entry(
+        hass,
+        data={
+            CONF_URL: TEST_URL,
+            CONF_USERNAME: "user",
+            CONF_PASSWORD: "pass",
+            CONF_AUTH_MODE: AUTH_MODE_BASIC,
+        },
+    )
+    client = create_mock_frigate_client()
+
+    with patch(
+        "custom_components.frigate.FrigateApiClient",
+        return_value=client,
+    ) as mock_client_class:
+        await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert config_entry.state == ConfigEntryState.LOADED
+
+    # A dedicated session with an unsafe cookie jar (i.e. one that also
+    # accepts cookies from IP-address hosts) was passed to the client, rather
+    # than Home Assistant's shared session.
+    session = mock_client_class.call_args[0][1]
+    assert session is not async_get_clientsession(hass)
+    assert isinstance(session.cookie_jar, aiohttp.CookieJar)
+    assert session.cookie_jar._unsafe  # pylint: disable=protected-access
 
 
 async def test_entry_update(hass: HomeAssistant) -> None:

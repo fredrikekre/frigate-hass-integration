@@ -1229,3 +1229,146 @@ async def test_get_auth_headers_bearer_mode_missing_password(
     headers = await frigate_client.get_auth_headers()
 
     assert headers == {}
+
+
+@pytest.fixture
+async def aiohttp_cookie_session() -> AsyncGenerator[aiohttp.ClientSession]:
+    """Test fixture for an aiohttp.ClientSession that accepts cookies from IPs.
+
+    The default aiohttp cookie jar ignores cookies set by IP-address hosts
+    (such as the test server), so an unsafe jar is needed to exercise the
+    proxy session cookie caching. This matches the session the integration
+    creates for the proxy auth modes.
+    """
+    async with aiohttp.ClientSession(
+        cookie_jar=aiohttp.CookieJar(unsafe=True)
+    ) as session:
+        yield session
+
+
+async def test_proxy_session_cookie_reused(
+    aiohttp_cookie_session: aiohttp.ClientSession, aiohttp_server: Any
+) -> None:
+    """Test that a proxy session cookie replaces credentials once available."""
+    stats_in = {"detection_fps": 8.1}
+    # (Authorization header, session cookie) for each request received.
+    requests_seen: list[tuple[str | None, str | None]] = []
+
+    async def stats_handler(request: web.Request) -> web.Response:
+        requests_seen.append(
+            (request.headers.get("Authorization"), request.cookies.get("proxy_session"))
+        )
+        if request.headers.get("Authorization") == "Basic dXNlcjpwYXNz":
+            response = web.json_response(stats_in)
+            response.set_cookie("proxy_session", "sess1")
+            return response
+        if request.cookies.get("proxy_session") == "sess1":
+            return web.json_response(stats_in)
+        raise web.HTTPUnauthorized()
+
+    server = await start_frigate_server(
+        aiohttp_server, [web.get("/api/stats", stats_handler)]
+    )
+    frigate_client = FrigateApiClient(
+        str(server.make_url("/")),
+        aiohttp_cookie_session,
+        username="user",
+        password="pass",
+        auth_mode=AUTH_MODE_BASIC,
+    )
+
+    # First call: no cookie cached yet, so credentials are sent and the
+    # proxy's session cookie is captured.
+    assert stats_in == await frigate_client.async_get_stats()
+    assert requests_seen == [("Basic dXNlcjpwYXNz", None)]
+
+    # Subsequent calls: the session cookie is relied upon and the
+    # Authorization header is not sent.
+    assert stats_in == await frigate_client.async_get_stats()
+    assert stats_in == await frigate_client.async_get_stats()
+    assert requests_seen[1:] == [(None, "sess1"), (None, "sess1")]
+
+
+async def test_proxy_session_cookie_expiry_falls_back_to_credentials(
+    aiohttp_cookie_session: aiohttp.ClientSession, aiohttp_server: Any
+) -> None:
+    """Test fallback to credentials when the proxy rejects the cookie."""
+    stats_in = {"detection_fps": 8.1}
+    requests_seen: list[tuple[str | None, str | None]] = []
+    valid_sessions = {"sess1"}
+    session_counter = 1
+
+    async def stats_handler(request: web.Request) -> web.Response:
+        requests_seen.append(
+            (request.headers.get("Authorization"), request.cookies.get("proxy_session"))
+        )
+        if request.headers.get("Authorization") == "Bearer static-token":
+            response = web.json_response(stats_in)
+            response.set_cookie("proxy_session", f"sess{session_counter}")
+            return response
+        if request.cookies.get("proxy_session") in valid_sessions:
+            return web.json_response(stats_in)
+        raise web.HTTPUnauthorized()
+
+    server = await start_frigate_server(
+        aiohttp_server, [web.get("/api/stats", stats_handler)]
+    )
+    frigate_client = FrigateApiClient(
+        str(server.make_url("/")),
+        aiohttp_cookie_session,
+        password="static-token",
+        auth_mode=AUTH_MODE_BEARER,
+    )
+
+    # Prime the session cookie and verify it is being used.
+    assert stats_in == await frigate_client.async_get_stats()
+    assert stats_in == await frigate_client.async_get_stats()
+    assert requests_seen == [("Bearer static-token", None), (None, "sess1")]
+
+    # "Expire" the session server-side: the next call transparently falls
+    # back to credentials after the cookie is rejected.
+    valid_sessions.clear()
+    assert stats_in == await frigate_client.async_get_stats()
+    assert requests_seen[2:] == [(None, "sess1"), ("Bearer static-token", "sess1")]
+
+    # The rejected cookie is remembered: since the proxy re-issued the same
+    # cookie value, the next call sends credentials directly instead of
+    # first failing with the cookie again.
+    assert stats_in == await frigate_client.async_get_stats()
+    assert requests_seen[4:] == [("Bearer static-token", "sess1")]
+
+    # Once the proxy issues a new session cookie, cookie auth resumes.
+    session_counter = 2
+    valid_sessions.add("sess2")
+    assert stats_in == await frigate_client.async_get_stats()  # Gets sess2 cookie.
+    assert stats_in == await frigate_client.async_get_stats()
+    assert requests_seen[5:] == [("Bearer static-token", "sess1"), (None, "sess2")]
+
+
+async def test_proxy_session_cookie_invalid_credentials(
+    aiohttp_cookie_session: aiohttp.ClientSession, aiohttp_server: Any
+) -> None:
+    """Test that invalid credentials fail without a cookie retry loop."""
+    requests_seen: list[str | None] = []
+
+    async def stats_handler(request: web.Request) -> web.Response:
+        requests_seen.append(request.headers.get("Authorization"))
+        raise web.HTTPUnauthorized()
+
+    server = await start_frigate_server(
+        aiohttp_server, [web.get("/api/stats", stats_handler)]
+    )
+    frigate_client = FrigateApiClient(
+        str(server.make_url("/")),
+        aiohttp_cookie_session,
+        username="user",
+        password="wrong",
+        auth_mode=AUTH_MODE_BASIC,
+    )
+
+    with pytest.raises(FrigateApiClientError):
+        await frigate_client.async_get_stats()
+
+    # Exactly one request: the credentials were sent (no cookie was cached)
+    # and the 401 was not retried.
+    assert requests_seen == ["Basic dXNlcjp3cm9uZw=="]
