@@ -14,6 +14,7 @@ import logging
 import re
 from typing import Any, Final, cast
 
+import aiohttp
 from awesomeversion import AwesomeVersion
 from titlecase import titlecase
 import voluptuous as vol
@@ -44,14 +45,22 @@ from homeassistant.core import (
 )
 from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import device_registry as dr, entity_registry as er, llm
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import (
+    async_create_clientsession,
+    async_get_clientsession,
+)
 from homeassistant.helpers.entity import DeviceInfo, Entity
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.loader import async_get_integration
 from homeassistant.util import slugify
 
-from .api import AUTH_MODE_LOGIN, FrigateApiClient, FrigateApiClientError
+from .api import (
+    AUTH_MODE_LOGIN,
+    PROXY_AUTH_MODES,
+    FrigateApiClient,
+    FrigateApiClientError,
+)
 from .const import (
     ATTR_CLIENT,
     ATTR_CONFIG,
@@ -339,9 +348,23 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up this integration using UI."""
+    auth_mode = entry.data.get(CONF_AUTH_MODE, AUTH_MODE_LOGIN)
+    if auth_mode in PROXY_AUTH_MODES:
+        # Use a dedicated session so that a session cookie set by the
+        # authentication proxy can be cached and reused for subsequent
+        # requests (see api.py), scoped to this config entry rather than
+        # polluting Home Assistant's shared session. The unsafe cookie jar
+        # also allows cookies when Frigate is reached via an IP address.
+        # The session is closed automatically when the config entry is
+        # unloaded.
+        session = async_create_clientsession(
+            hass, cookie_jar=aiohttp.CookieJar(unsafe=True)
+        )
+    else:
+        session = async_get_clientsession(hass)
     client = FrigateApiClient(
         str(entry.data.get(CONF_URL)),
-        async_get_clientsession(hass),
+        session,
         entry.data.get(CONF_USERNAME),
         entry.data.get(CONF_PASSWORD),
         entry.data.get(CONF_VALIDATE_SSL, True),

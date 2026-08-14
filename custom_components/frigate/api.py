@@ -26,11 +26,17 @@ HEADERS = {"Content-type": "application/json; charset=UTF-8"}
 # - AUTH_MODE_LOGIN (default): Frigate's native JWT login via POST /api/login
 #   using the username/password.
 # - AUTH_MODE_BASIC: send a Basic Authorization header built from the
-#   username/password on every request, for reverse proxies that perform HTTP
-#   Basic Auth in front of Frigate (Frigate's own login is never called).
+#   username/password, for reverse proxies that perform HTTP Basic Auth in
+#   front of Frigate (Frigate's own login is never called).
 # - AUTH_MODE_BEARER: send a Bearer Authorization header with the password as
-#   a static token on every request, for reverse proxies that expect a static
-#   bearer token (the username is ignored in this mode).
+#   a static token, for reverse proxies that expect a static bearer token
+#   (the username is ignored in this mode).
+#
+# In the proxy auth modes, if the proxy sets a session cookie after a
+# successful credential exchange, subsequent requests rely on that cookie
+# instead of re-sending the Authorization header (which would force the proxy
+# to re-validate the credentials on every request). Credentials are re-sent
+# when the proxy rejects the cached cookie (e.g. on session expiry).
 AUTH_MODE_LOGIN = "login"
 AUTH_MODE_BASIC = "basic"
 AUTH_MODE_BEARER = "bearer"
@@ -80,6 +86,9 @@ class FrigateApiClient:
             self._proxy_auth_header = f"Basic {credentials}"
         elif auth_mode == AUTH_MODE_BEARER and password:
             self._proxy_auth_header = f"Bearer {password}"
+        # Fingerprint of the session cookies that were most recently rejected
+        # by the proxy (see _should_use_cookie_auth).
+        self._rejected_cookie_fingerprint: tuple[tuple[str, str], ...] | None = None
 
     async def async_get_version(self) -> str:
         """Get data from the API."""
@@ -510,6 +519,32 @@ class FrigateApiClient:
 
         return headers
 
+    def _proxy_cookie_fingerprint(self) -> tuple[tuple[str, str], ...] | None:
+        """Fingerprint the cookies the session would send to the Frigate host."""
+        cookies = self._session.cookie_jar.filter_cookies(URL(self._host))
+        if not cookies:
+            return None
+        return tuple(sorted((name, morsel.value) for name, morsel in cookies.items()))
+
+    def _should_use_cookie_auth(self) -> bool:
+        """
+        Whether to rely on a cached proxy session cookie instead of sending
+        the Authorization header.
+
+        This is the case in the proxy auth modes when the session's cookie
+        jar holds cookies for the Frigate host (i.e. the proxy set a session
+        cookie after an earlier credential exchange), except when those exact
+        cookies have already been rejected by the proxy (which would mean
+        they do not represent a valid session and re-sending the credentials
+        is required).
+        """
+        if self._auth_mode not in PROXY_AUTH_MODES or not self._proxy_auth_header:
+            return False
+        fingerprint = self._proxy_cookie_fingerprint()
+        return (
+            fingerprint is not None and fingerprint != self._rejected_cookie_fingerprint
+        )
+
     async def api_wrapper(
         self,
         method: str,
@@ -519,6 +554,7 @@ class FrigateApiClient:
         decode_json: bool = True,
         is_login_request: bool = False,
         timeout: int | None = None,
+        allow_cookie_auth: bool = True,
     ) -> Any:
         """Get information from the API."""
         if data is None:
@@ -526,7 +562,12 @@ class FrigateApiClient:
         if headers is None:
             headers = {}
 
-        if not is_login_request:
+        use_cookie_auth = (
+            allow_cookie_auth
+            and not is_login_request
+            and self._should_use_cookie_auth()
+        )
+        if not is_login_request and not use_cookie_auth:
             headers.update(await self.get_auth_headers())
 
         try:
@@ -557,6 +598,27 @@ class FrigateApiClient:
             raise FrigateApiClientError from exc
 
         except aiohttp.ClientResponseError as exc:
+            if use_cookie_auth and exc.status in (401, 403):
+                # The proxy no longer accepts the cached session cookie (e.g.
+                # the session expired), so fall back to a full credential
+                # exchange. Remember the rejected cookies so that cookie auth
+                # is not attempted again until the proxy issues new ones.
+                self._rejected_cookie_fingerprint = self._proxy_cookie_fingerprint()
+                _LOGGER.debug(
+                    "Proxy session cookie rejected (%d) for %s;"
+                    " retrying with credentials",
+                    exc.status,
+                    url,
+                )
+                return await self.api_wrapper(
+                    method,
+                    url,
+                    data=data,
+                    headers=headers,
+                    decode_json=decode_json,
+                    timeout=timeout,
+                    allow_cookie_auth=False,
+                )
             if exc.status == 401:
                 _LOGGER.error(
                     "Unauthorized (401) error for URL %s: %s", url, exc.message
